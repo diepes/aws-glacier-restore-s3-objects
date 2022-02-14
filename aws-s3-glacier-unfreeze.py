@@ -2,11 +2,13 @@
 # Base From: https://stackoverflow.com/questions/20033651/how-to-restore-folders-or-entire-buckets-to-amazon-s3-from-glacier https://stackoverflow.com/users/3299397/kyle-bridenstine
 # 2022-02 modified, add bucket as argument, put in github, print updates for large s3 thaw
 import argparse
+
 # import base64
 # import json
 import os
 import sys
 from datetime import datetime
+
 # from pathlib import Path
 
 import boto3
@@ -14,6 +16,7 @@ import boto3
 # import pymysql.cursors
 # import yaml
 from botocore.exceptions import ClientError
+
 
 def reportStatuses(
     operation,
@@ -116,7 +119,7 @@ def status(foldersToRestore, restoreTTL, s3Bucket):
 
                 pageCount = pageCount + 1
                 print(
-                    f"{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}  ... progress {pageCount=} {len(totalS3ObjKeysRestoreNotRequestedYet)=} {len(totalS3ObjKeysRestoreInProgress)=} {len(totalS3ObjKeysRestoreFinished)=} "
+                    f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  ... progress {pageCount=} {len(totalS3ObjKeysRestoreNotRequestedYet)=} {len(totalS3ObjKeysRestoreInProgress)=} {len(totalS3ObjKeysRestoreFinished)=} "
                 )
 
             # Report the total statuses for the folders
