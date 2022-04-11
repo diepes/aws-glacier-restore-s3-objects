@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # Base From: https://stackoverflow.com/questions/20033651/how-to-restore-folders-or-entire-buckets-to-amazon-s3-from-glacier https://stackoverflow.com/users/3299397/kyle-bridenstine
 # 2022-02 modified, add bucket as argument, put in github, print updates for large s3 thaw
+import cProfile
 import argparse
+from dataclasses import dataclass
+from hashlib import new
 
 # import base64
 # import json
@@ -23,157 +26,201 @@ import asyncio
 import concurrent.futures
 import functools
 
+import dataclasses
+import json
+import re
 
+time_start = time.monotonic()
+
+
+@dataclass
+class class_totals:
+    """Class to keep track of progress"""
+
+    Keys: list = dataclasses.field(default_factory=list, repr=False)
+    KeysSkippedFolders: list = dataclasses.field(default_factory=list, repr=False)
+    KeysRestoreFinished: list = dataclasses.field(default_factory=list, repr=False)
+    KeysRestoreInProgress: list = dataclasses.field(default_factory=list, repr=False)
+    KeysRestoreNotRequestedYet: list = dataclasses.field(
+        default_factory=list, repr=False
+    )
+    KeysRestoreStatusUnknown: list = dataclasses.field(default_factory=list, repr=False)
+    KeysNotes: dict = dataclasses.field(default_factory=dict, repr=False)
+
+    def __str__(self):
+        return f"Keys[ Total:{len(self.Keys)} Folders:{len(self.KeysSkippedFolders)} Thawed:{len(self.KeysRestoreFinished)} InProgress:{len(self.KeysRestoreInProgress)} NotReq:{len(self.KeysRestoreNotRequestedYet)} Unk:{len(self.KeysRestoreStatusUnknown)} ]"
+
+    def __repr__(self):
+        return f"Keys[ Total:{len(self.Keys)} Folders:{len(self.KeysSkippedFolders)} Thawed:{len(self.KeysRestoreFinished)} InProgress:{len(self.KeysRestoreInProgress)} NotReq:{len(self.KeysRestoreNotRequestedYet)} Unk:{len(self.KeysRestoreStatusUnknown)} ]"
+
+
+def add_totals(totals: class_totals, extratotals: class_totals):
+    totals.Keys.extend(extratotals.Keys)
+    totals.KeysSkippedFolders.extend(extratotals.KeysSkippedFolders)
+    totals.KeysRestoreFinished.extend(extratotals.KeysRestoreFinished)
+    totals.KeysRestoreInProgress.extend(extratotals.KeysRestoreInProgress)
+    totals.KeysRestoreNotRequestedYet.extend(extratotals.KeysRestoreNotRequestedYet)
+    totals.KeysRestoreStatusUnknown.extend(extratotals.KeysRestoreStatusUnknown)
+    totals.KeysNotes.update(extratotals.KeysNotes)
+
+
+####################################
 def reportStatuses(
     operation,
     type,
     successOperation,
-    totals,
-    # restoreFinished,
-    # restoreInProgress,
-    # restoreNotRequestedYet,
-    # restoreStatusUnknown,
-    # skippedFolders,
+    totals: class_totals,
     outputFileBase,
-    outputMsg="",
+    outputMsg="no outputMsg",
 ):
     """
     reportStatuses gives a generic, aggregated report for all operations (Restore, Status, Download)
     """
 
-    report = 'Status Report For "{}" Operation. Of the {} total {}, {} are finished being {}, {} have a restore in progress, {} have not been requested to be restored yet, {} reported an unknown restore status, and {} were asked to be skipped.'.format(
-        operation,
-        str(len(totals["Keys"])),
-        type,
-        str(len(totals["KeysRestoreFinished"])),
-        successOperation,
-        str(len(totals["KeysRestoreInProgress"])),
-        str(len(totals["KeysRestoreNotRequestedYet"])),
-        str(len(totals["KeysRestoreStatusUnknown"])),
-        str(len(totals["KeysSkippedFolders"])),
+    report = (
+        f'Status Report {successOperation} "{operation}". {type} total={len(totals.Keys)} = '
+        f"finished={len(totals.KeysRestoreFinished)}, "
+        f"InProgress={len(totals.KeysRestoreInProgress)}, "
+        f"NotRequested={len(totals.KeysRestoreNotRequestedYet)}, "
+        f"Unknown={len(totals.KeysRestoreStatusUnknown)}, "
+        f"SkippedFolders={len(totals.KeysSkippedFolders)}, "
+        f"Notes={len(totals.KeysNotes.keys())}"
     )
 
-    if (len(totals["Keys"]) - len(totals["KeysSkippedFolders"])) == len(
-        totals["KeysRestoreFinished"]
+    if (len(totals.Keys) - len(totals.KeysSkippedFolders)) == len(
+        totals.KeysRestoreFinished
     ):
         print(report)
-        print("Success: All {} operations are complete".format(operation))
+        print(f"    Success: All {operation} operations are complete")
     else:
-        if (len(totals["Keys"]) - len(totals["KeysSkippedFolders"])) == len(
-            totals["KeysRestoreNotRequestedYet"]
+        if (len(totals.Keys) - len(totals.KeysSkippedFolders)) == len(
+            totals.KeysRestoreNotRequestedYet
         ):
             print(report)
-            print("Attention: No {} operations have been requested".format(operation))
+            print(f"    Attention: No {operation} operations have been requested")
         else:
             print(report)
-            print("Attention: Not all {} operations are complete yet".format(operation))
+            print(f"    Attention: Not all {operation} operations are complete yet")
     if outputFileBase:  # Only write to file if var set.
         with open(
             f"{outputFileBase}.restoreInProgress.csv", mode="at", encoding="utf-8"
         ) as myfile:
+            print(
+                f"DEBUG-output {len(totals.KeysRestoreInProgress)=} {totals.KeysRestoreInProgress=}"
+            )
             myfile.write(f"# {outputMsg}\n")
-            myfile.write("\n".join(totals["KeysRestoreInProgress"]))
+            myfile.write(f"# {report}\n")
+            myfile.write("\n".join(totals.KeysRestoreInProgress))
+            myfile.write("\n")
+            myfile.write(
+                "\n".join([f"# {k} - {v}" for k, v in totals.KeysNotes.items()])
+            )
+            myfile.write("\n")
 
 
-async def status(foldersToRestore, restoreTTL, s3Bucket, outputFileBase):
+async def processPage(
+    page,
+    pageCount,
+    rawS3Path,
+    s3Bucket,
+    outputFileBase,
+    operation,
+    restoreTTL=14,
+) -> class_totals:
+    """Takes page of s3 objects and checks or un-thaw's them, keeps totals for this page and returns them"""
+    prefix = f"processPage p#{pageCount}"
+    print(f"{prefix} {len(page['Contents'])=} started ...")
+    time_start_page = time.monotonic()
+    count_page_files = 0
 
     s3 = boto3.resource("s3")
+    bucket = s3.Bucket(s3Bucket)
     s3_Object = aio(s3.Object)
 
-    folders = []
-    time_start = time.monotonic()
-    # Read the list of folders to process
-    with open(foldersToRestore, "r") as f:
+    s3Obj = class_totals()
 
-        for rawS3Path in f.read().splitlines():
-
-            folders.append(rawS3Path)
-
-            maxKeys = 1000
-            # Remove the S3 Bucket Prefix to get just the S3 Path i.e., the S3 Objects prefix and key name
-            s3Path = removeS3BucketPrefixFromPath(rawS3Path, s3Bucket)
-
-            # Construct an S3 Paginator that returns pages of S3 Object Keys with the defined prefix
-            client = boto3.client("s3")
-            #    s3 = boto3.client('s3')
-            # get_object = aio(s3.get_object)
-            paginator = client.get_paginator("list_objects")
-            operation_parameters = {
-                "Bucket": s3Bucket,
-                "Prefix": s3Path,
-                "MaxKeys": maxKeys,
-            }
-            page_iterator = paginator.paginate(**operation_parameters)
-
-            async def processPage(page, total, pageCount):
-                time_start_page = time.monotonic()
-                count_page_files = 0
-                start_ObjectKeys = len(total["Keys"]) - 1
-                for s3Content in page["Contents"]:
-                    s3ObjectKey = s3Content["Key"]
-                    count_page_files += 1
-                    # Folders show up as Keys but they cannot be restored or downloaded so we just ignore them
-                    if s3ObjectKey.endswith("/"):
-                        total["KeysSkippedFolders"].append(s3ObjectKey)
-                        print(
-                            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  ... skip dir {s3ObjectKey}"
-                            + f" {pageCount=} {len(total['KeysRestoreNotRequestedYet'])=}"
-                            + f" {len(total['KeysRestoreFinished'])=} {time.monotonic()-time_start_page:0.2f}s {count_page_files/(time.monotonic()-time_start_page):0.0f}obj/sec"
-                            + f" {(len(total['Keys'])-start_ObjectKeys)/(time.monotonic()-time_start_page):0.0f}objAll/sec                      ",
-                            end="\n",
-                        )
-                        continue
-
-                    total["Keys"].append(s3ObjectKey)
-
-                    # s3Object = s3.Object(s3Bucket, s3ObjectKey)
-                    s3Object = await s3_Object(bucket_name=s3Bucket, key=s3ObjectKey)
-
-                    if s3Object.restore is None:
-                        total["KeysRestoreNotRequestedYet"].append(s3ObjectKey)
-                    elif "true" in s3Object.restore:
-                        total["KeysRestoreInProgress"].append(s3ObjectKey)
-                    elif "false" in s3Object.restore:
-                        total["KeysRestoreFinished"].append(s3ObjectKey)
-                    else:
-                        total["KeysRestoreStatusUnknown"].append(s3ObjectKey)
-
-                print(
-                    f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  ... progress {pageCount=} {len(total['KeysRestoreNotRequestedYet'])=} {len(total['KeysRestoreInProgress'])=} {len(total['KeysRestoreFinished'])=} "
-                )
-
-            pageCount = 0
-            total = dict()
-            total["KeysSkippedFolders"] = []
-            total["Keys"] = []
-            total["KeysRestoreFinished"] = []
-            total["KeysRestoreInProgress"] = []
-            total["KeysRestoreNotRequestedYet"] = []
-            total["KeysRestoreStatusUnknown"] = []
-
-            # Iterate through the pages of S3 Object Keys
-            await asyncio.gather(
-                *(processPage(page, total, i) for i, page in enumerate(page_iterator))
-            )
-            # for page in page_iterator:
-            #     pageCount = pageCount + 1
-            #     await processPage(page, total, pageCount)
-
-            # Report the total statuses for the folders
-            reportStatuses(
-                "restore folder " + rawS3Path,
-                "files",
-                "restored",
-                totals=total,
-                outputFileBase=outputFileBase,
-            )
-
+    for s3Content in page["Contents"]:
+        # print(f"{prefix} {s3Obj=}")
+        count_page_files += 1
+        s3ObjectKey = s3Content["Key"]
+        # Folders show up as Keys but they cannot be restored or downloaded so we just ignore them
+        if s3ObjectKey.endswith("/"):
+            s3Obj.KeysSkippedFolders.append(s3ObjectKey)
+            s3Obj.Keys.append(s3ObjectKey)  # Total includes folders
+            s3Obj.KeysNotes[s3ObjectKey] = f"Skipping folder {s3ObjectKey}"
             print(
-                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  DONE"
-                + f" {total['Keys']=} {len(total['KeysRestoreNotRequestedYet'])=}"
-                + f" {len(total['KeysRestoreFinished'])=} {time.monotonic()-time_start:0.2f}s {total['Keys']/(time.monotonic()-time_start):0.0f}obj/sec                      ",
-                end="\n",
+                f"    {prefix} Skipping this S3 Object Key because it's a folder {s3ObjectKey}"
             )
+            continue  # For loop, not included in Keys.
+        s3Obj.Keys.append(s3ObjectKey)
+        # Get s3 object status
+        s3Object = await s3_Object(bucket_name=s3Bucket, key=s3ObjectKey)
+        restore_requested = False
+        msg = ""
+        # Ensure this folder was not already processed for a restore
+        # If not request restore
+        if s3Object.restore is None and operation == "restore":
+            restore_response = bucket.meta.client.restore_object(
+                Bucket=s3Object.bucket_name,
+                Key=s3Object.key,
+                RestoreRequest={"Days": restoreTTL},
+            )
+            # msg += f" ReqRestore:{str(restore_response)=}"
+            # Refresh object and check that the restore request was successfully processed
+            # s3Object = s3.Object(s3Bucket, s3ObjectKey)
+            s3Object = await s3_Object(bucket_name=s3Bucket, key=s3ObjectKey)
+            restore_requested = True
+            msg += f" ReqRestore:[{s3Object.restore}=]"
+        # [{s3Object.restore}]
+        # Final check of object restore status
+        if s3Object.restore is None:
+            s3Obj.KeysRestoreNotRequestedYet.append(s3ObjectKey)
+            if restore_requested:  # ToDo: error counter ?
+                msg += f" ERR:restore_request_failed"
+            # Instead of failing the entire job continue restoring the rest of the log tree(s)
+            # raise Exception("%s restore request failed" % s3Object.key)
+        elif "true" in s3Object.restore:
+            msg += (
+                f" RESTORE:Success"
+                if restore_requested
+                else f" RESTORE:already_received"
+            )
+            s3Obj.KeysRestoreInProgress.append(s3ObjectKey)
+        elif "false" in s3Object.restore:
+            ## s3Object.restore='ongoing-request="false", expiry-date="Thu, 14 Apr 2022 00:00:00 GMT"'
+            restore = re.sub(r"([\w-]+)=", r'"\1":', f"{{{s3Object.restore}}}")
+            restore_dict = json.loads(restore)
+            msg += (
+                f" RESTORE:requested_and_done"
+                if restore_requested
+                else f" RESTORE:done expire=\"{restore_dict.get('expiry-date','No-expiry-date')}\""
+            )
+            s3Obj.KeysRestoreFinished.append(s3ObjectKey)
+        else:
+            msg += f" Unknown restore status ({s3Object.restore})"
+            s3Obj.KeysRestoreStatusUnknown.append(s3ObjectKey)
+        s3Obj.KeysNotes[s3ObjectKey] = msg
+
+        runseconds = time.monotonic() - time_start_page
+        # print(
+        #     f"S3 Obj class:{s3Object.storage_class}"
+        #     + f" stats #{pageCount} {runseconds:0.2f}s"
+        #     + f" @{(count_page_files)/runseconds:0.1f}obj/sec"
+        #     + f" Key:{s3Content['Key']} {msg}"
+        # )
+
+    runsecondsTotal = time.monotonic() - time_start
+    # Report the statuses per S3 Key Page
+    reportStatuses(
+        operation="folder:" + rawS3Path + "-p#" + str(pageCount),
+        type="files in this page",
+        successOperation="restored",
+        totals=s3Obj,
+        outputFileBase=outputFileBase,
+        outputMsg=f"page:{pageCount} objs:{len(s3Obj.Keys)} objsInProgress:{len(s3Obj.KeysRestoreInProgress)} in {runsecondsTotal:0.1f}sec",
+    )
+    # print(f"    {prefix} done.")
+    return s3Obj
 
 
 def removeS3BucketPrefixFromPath(path, bucket):
@@ -207,16 +254,13 @@ async def restore_or_status(
     bucket = s3.Bucket(s3Bucket)
     s3_Object = aio(s3.Object)
 
-    time_start = time.monotonic()
     folders = []
+    total = class_totals()
 
     # Read the list of folders to process
     with open(foldersToRestore, "r") as f:
-
         for rawS3Path in f.read().splitlines():
-
             folders.append(rawS3Path)
-
             # Skip folders that are commented out of the file
             if "#" in rawS3Path:
                 print(
@@ -224,18 +268,17 @@ async def restore_or_status(
                         rawS3Path
                     )
                 )
-                folders.append(rawS3Path)
+                # folders.append(rawS3Path)
+                continue
             elif operation == "restore":
                 print("Restoring folder {}".format(rawS3Path))
 
             maxKeys = 1000
             # Remove the S3 Bucket Prefix to get just the S3 Path i.e., the S3 Objects prefix and key name
             s3Path = removeS3BucketPrefixFromPath(rawS3Path, s3Bucket)
-
             print(
                 "s3Bucket={}, s3Path={}, maxKeys={}".format(s3Bucket, s3Path, maxKeys)
             )
-
             # Construct an S3 Paginator that returns pages of S3 Object Keys with the defined prefix
             client = boto3.client("s3")
             paginator = client.get_paginator("list_objects")
@@ -245,147 +288,102 @@ async def restore_or_status(
                 "MaxKeys": maxKeys,
             }
             page_iterator = paginator.paginate(**operation_parameters)
+            activetasks = list()  # list of active tasks.
 
-            pageCount = 0
-
-            total = dict()
-            total["KeysSkippedFolders"] = []
-            total["Keys"] = []
-            total["KeysRestoreFinished"] = []
-            total["KeysRestoreInProgress"] = []
-            total["KeysRestoreNotRequestedYet"] = []
-            total["KeysRestoreStatusUnknown"] = []
-
-            # Iterate through the pages of S3 Object Keys
-            for page in page_iterator:
-                time_start_page = time.monotonic()
-                print("Processing S3 Key Page {}".format(str(pageCount)))
-
-                s3Obj = dict()
-                s3Obj["Keys"] = []
-                s3Obj["KeysSkippedFolders"] = []
-                s3Obj["KeysRestoreFinished"] = []
-                s3Obj["KeysRestoreInProgress"] = []
-                s3Obj["KeysRestoreNotRequestedYet"] = []
-                s3Obj["KeysRestoreStatusUnknown"] = []
-
-                for s3Content in page["Contents"]:
-
-                    print("Processing S3 Object Key {}".format(s3Content["Key"]))
-
-                    s3ObjectKey = s3Content["Key"]
-
-                    # Folders show up as Keys but they cannot be restored or downloaded so we just ignore them
-                    if s3ObjectKey.endswith("/"):
-                        s3Obj["KeysSkippedFolders"].append(s3ObjectKey)
-                        total["KeysSkippedFolders"].append(s3ObjectKey)
-                        print(
-                            "    Skipping this S3 Object Key because it's a folder {}".format(
-                                s3ObjectKey
-                            )
-                        )
-                        continue
-
-                    s3Obj["Keys"].append(s3ObjectKey)
-                    total["Keys"].append(s3ObjectKey)
-
-                    # Get s3 object status
-                    # s3Object = s3.Object(s3Bucket, s3ObjectKey)
-                    s3Object = await s3_Object(bucket_name=s3Bucket, key=s3ObjectKey)
-                    restore_requested = False
-
+            async def asyncpages(max_pages=3):
+                # Iterate through the pages of S3 Object Keys
+                for pageCount, page in enumerate(page_iterator):
                     print(
-                        "    {} - {} - {}".format(
-                            s3Object.key, s3Object.storage_class, s3Object.restore
+                        "Starting Processing for S3 Keys Page {}".format(str(pageCount))
+                    )
+                    activetasks.append(
+                        asyncio.create_task(
+                            processPage(
+                                page=page,
+                                pageCount=pageCount,
+                                rawS3Path=rawS3Path,
+                                s3Bucket=s3Bucket,
+                                outputFileBase=f"{outputFileBase}-{s3Path}-P{pageCount}",
+                                operation=operation,
+                                restoreTTL=restoreTTL,
+                            ),
+                            name=f"page{pageCount}",
                         )
                     )
+                    if (
+                        len(activetasks) >= max_pages
+                    ):  # When max task, wait for oldest to finish
+                        result = await asyncio.gather(activetasks.pop(0))
+                        print(f"{result=}")
+                # Wait for last tasks to finish.
+                results = await asyncio.gather(*activetasks)
+                for result in results:
+                    add_totals(total, result)
 
-                    # Ensure this folder was not already processed for a restore
-                    # If not request restore
-                    if s3Object.restore is None and operation == "restore":
-                        restore_response = bucket.meta.client.restore_object(
-                            Bucket=s3Object.bucket_name,
-                            Key=s3Object.key,
-                            RestoreRequest={"Days": restoreTTL},
-                        )
-                        print("    Restore Response: {}".format(str(restore_response)))
-                        # Refresh object and check that the restore request was successfully processed
-                        # s3Object = s3.Object(s3Bucket, s3ObjectKey)
-                        s3Object = await s3_Object(
-                            bucket_name=s3Bucket, key=s3ObjectKey
-                        )
-                        restore_requested = True
-                        print(
-                            "    {} - {} - {}".format(
-                                s3Object.key, s3Object.storage_class, s3Object.restore
+            # Options2 threads
+            def wrapper(coro):
+                return asyncio.run(coro)
+
+            async def threadpages(max_pages):
+                with concurrent.futures.ThreadPoolExecutor(  # Options ThreadPool or ProcessPool
+                    max_workers=max_pages
+                ) as executor:
+                    futures = dict()
+                    for pageCount, page in enumerate(page_iterator):
+                        futures[  # Use future as key
+                            executor.submit(
+                                wrapper,
+                                processPage(
+                                    page=page,
+                                    pageCount=pageCount,
+                                    rawS3Path=rawS3Path,
+                                    s3Bucket=s3Bucket,
+                                    outputFileBase=f"{outputFileBase}-{s3Path}-P{pageCount}",
+                                    operation=operation,
+                                    restoreTTL=restoreTTL,
+                                ),
                             )
-                        )
+                        ] = {"pageCount": pageCount, "pageLen": len(page["Contents"])}
 
-                    # Final check of object restore status
-                    if s3Object.restore is None:
-                        s3Obj["KeysRestoreNotRequestedYet"].append(s3ObjectKey)
-                        total["KeysRestoreNotRequestedYet"].append(s3ObjectKey)
-                        if restore_requested:  # ToDo: error counter ?
-                            print("    %s restore request failed" % s3Object.key)
-                        # Instead of failing the entire job continue restoring the rest of the log tree(s)
-                        # raise Exception("%s restore request failed" % s3Object.key)
-                    elif "true" in s3Object.restore:
-                        msg = (
-                            "    This file has successfully been restored: {}"
-                            if restore_requested
-                            else "    Restore request already received for {}"
-                        )
-                        print(msg.format(s3Object.key))
-                        s3Obj["KeysRestoreInProgress"].append(s3ObjectKey)
-                        total["KeysRestoreInProgress"].append(s3ObjectKey)
-                    elif "false" in s3Object.restore:
-                        msg = (
-                            "    This file has successfully been restored: {}"
-                            if restore_requested
-                            else "    This file has successfully been restored: {}"
-                        )
-                        print(msg.format(s3Object.key))
-                        s3Obj["KeysRestoreFinished"].append(s3ObjectKey)
-                        total["KeysRestoreFinished"].append(s3ObjectKey)
-                    else:
+                    print(f"# All threads running ... waiting for them to finish")
+                    for future in concurrent.futures.as_completed(
+                        futures.keys(), timeout=60 * 10
+                    ):
+                        id = futures[future]  # pageCount, pageLen
                         print(
-                            "    Unknown restore status ({}) for file: {}".format(
-                                s3Object.restore, s3Object.key
-                            )
+                            f"# Thread {id['pageCount']} finished, get result and add to total {future.running()=} {future.done()=}"
                         )
-                        s3Obj["KeysRestoreStatusUnknown"].append(s3ObjectKey)
-                        total["KeysRestoreStatusUnknown"].append(s3ObjectKey)
+                        assert (
+                            future.done() == True
+                        ), f"Error got future back that is not done {id['pageCount']} {future=} ???"
+                        result = future.result()
+                        # result = await result_coroutine
+                        print(
+                            f"# DEBUG got result {time.ctime()}  {id=} {result=} {future=} {future.running()=} {future.done()=}"
+                        )
+                        add_totals(total, result)
 
-                # Report the statuses per S3 Key Page
-                reportStatuses(
-                    "folder-" + rawS3Path + "-page-" + str(pageCount),
-                    "files in this page",
-                    "restored",
-                    totals=s3Obj,
-                    # s3ObjKeys,
-                    # s3ObjKeysRestoreFinished,
-                    # s3ObjKeysRestoreInProgress,
-                    # s3ObjKeysRestoreNotRequestedYet,
-                    # s3ObjKeysRestoreStatusUnknown,
-                    outputFileBase=outputFileBase,
-                )
+            # Pick what to run
+            # await asyncpages(max_pages=3)
+            await threadpages(max_pages=40)
 
-                pageCount = pageCount + 1
+        # Report the total statuses for the files
+        runseconds = time.monotonic() - time_start
+        reportStatuses(
+            operation=f"{operation} done in {runseconds:0.2f}s @{len(total.Keys)/runseconds:0.1f}obj/sec",
+            type="files",
+            successOperation="restored",
+            totals=total,
+            outputFileBase=outputFileBase,
+            outputMsg="Final output - Done!",
+        )
 
-            if pageCount > 1:
-                # Report the total statuses for the files
-                reportStatuses(
-                    "restore-folder-" + rawS3Path,
-                    "files",
-                    "restored",
-                    totals=total,
-                    # total["Keys"],
-                    # total["KeysRestoreFinished"],
-                    # total["KeysRestoreInProgress"],
-                    # total["KeysRestoreNotRequestedYet"],
-                    # total["KeysRestoreStatusUnknown"],
-                    outputFileBase=outputFileBase,
-                )
+        print(
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  DONE"
+            + f" {len(total.Keys)=} {len(total.KeysRestoreNotRequestedYet)=}"
+            + f" {len(total.KeysRestoreFinished)=} {time.monotonic()-time_start:0.2f}s {len(total.Keys)/(time.monotonic()-time_start):0.0f}obj/sec                      ",
+            end="\n",
+        )
 
 
 def displayError(operation, exc):
@@ -442,11 +440,6 @@ def main(operation, foldersToRestore, restoreTTL, s3Bucket, outputFileBase):
                 operation=operation,
             )
         )
-    elif operation == "status":
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(
-            status(foldersToRestore, restoreTTL, s3Bucket, outputFileBase)
-        )
     else:
         raise Exception(
             "%s is an invalid operation. Please choose either 'restore' or 'status'"
@@ -493,7 +486,7 @@ if __name__ == "__main__":
         "-l",
         "--foldersToRestore",
         type=str,
-        default="~/git/tools-aws/folders_to_restore.csv",
+        default="~/git/tools-aws/aws-s3-glacier-restore-objects/folders_to_restore.csv",
         required=False,
         help="The location of the file containing the list of folders to restore. Put one folder on each line.",
     )
@@ -510,12 +503,13 @@ if __name__ == "__main__":
     parser.add_argument("--s3Bucket", required=True, help="S3 bucket to operate on.")
 
     args = parser.parse_args()
-    sys.exit(
-        main(
-            args.operation,
-            os.path.expanduser(args.foldersToRestore),
-            args.restoreTTL,
-            args.s3Bucket,
-            outputFileBase=os.path.expanduser(args.foldersToRestore),
-        )
+    # sys.exit(
+    # cProfile.run(
+    main(
+        args.operation,
+        os.path.expanduser(args.foldersToRestore),
+        args.restoreTTL,
+        args.s3Bucket,
+        outputFileBase=os.path.expanduser(args.foldersToRestore),
     )
+    # )
